@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"testing"
+	"time"
 )
 
 type mockClient struct {
 	count int
 }
+
+type mockStorage map[int64]int
 
 func (c *mockClient) Do(req *http.Request) (*http.Response, error) {
 	c.count++
@@ -22,19 +26,46 @@ func (c *mockClient) Post(url string, contentType string, body io.Reader) (resp 
 	return nil, nil
 }
 
-func TestDo(t *testing.T) {
-	var mockClient = &mockClient{}
-	var rlClient = NewSlidingWindowRLClient(mockClient, 10, 50)
-	for i := 0; i < 50; i++ {
-		if _, err := rlClient.Do(&http.Request{}); err != nil {
-			t.Errorf("Expected no error, got %s", err)
+func (s mockStorage) GetRequestsCountInInterval(ctx context.Context, start, end time.Time) (int, error) {
+	endUnix := end.Unix()
+	intervalStartInUnix := start.Unix()
+	cnt := 0
+	for i := intervalStartInUnix; i <= endUnix; i++ {
+		if _, ok := s[i]; ok {
+			cnt += s[i]
 		}
 	}
-	if _, err := rlClient.Do(&http.Request{}); err == nil {
-		t.Errorf("Expected error, got nil")
-	}
-	if mockClient.count != 50 {
-		t.Errorf("Expected 50 requests, got %d", mockClient.count)
-	}
+	return cnt, nil
+}
 
+func (s mockStorage) IncrementRequestCount(ctx context.Context, key time.Time) error {
+	s[key.Unix()]++
+	return nil
+}
+
+type doTest struct {
+	intervalInSeconds       int
+	requestsPerInterval     int
+	requestedCount          int
+	requestReceivedExpected int
+}
+
+var doTests = []doTest{
+	{10, 50, 50, 50},
+	{10, 50, 100, 50},
+}
+
+func TestDo(t *testing.T) {
+	for _, tt := range doTests {
+		mc := &mockClient{}
+		mockStorage := mockStorage{}
+		var rlClient = NewSlidingWindowRLClient(mc, tt.intervalInSeconds, tt.requestsPerInterval, mockStorage)
+		ctx := context.Background()
+		for i := 0; i < tt.requestedCount; i++ {
+			rlClient.Do(ctx, &http.Request{})
+		}
+		if mc.count != tt.requestReceivedExpected {
+			t.Errorf("Expected %d requests, got %d", tt.requestReceivedExpected, mc.count)
+		}
+	}
 }

@@ -1,48 +1,55 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 )
 
-type rlClient struct {
+type slidingWindowRLClient struct {
+	mu                  sync.Mutex
 	client              client
-	requests            map[int64]int
+	store               storage
 	intervalInSeconds   int
 	requestsPerInterval int
 }
 
 type client interface {
 	Do(req *http.Request) (*http.Response, error)
-	Get(url string) (resp *http.Response, err error)
-	Post(url string, contentType string, body io.Reader) (resp *http.Response, err error)
 }
 
-func NewSlidingWindowRLClient(cl client, intervalInSeconds, requestsPerInterval int) *rlClient {
-	return &rlClient{
+type storage interface {
+	// get the number of requests made in the provided interval
+	GetRequestsCountInInterval(ctx context.Context, start, end time.Time) (int, error)
+	// increment the number of requests made in the current interval
+	IncrementRequestCount(ctx context.Context, key time.Time) error
+}
+
+func NewSlidingWindowRLClient(cl client, intervalInSeconds, requestsPerInterval int, st storage) *slidingWindowRLClient {
+	return &slidingWindowRLClient{
 		client:              cl,
-		requests:            make(map[int64]int),
 		intervalInSeconds:   intervalInSeconds,
 		requestsPerInterval: requestsPerInterval,
+		store:               st,
 	}
 }
 
-func (c *rlClient) Get(link string) (resp *http.Response, err error) {
+func (c *slidingWindowRLClient) Get(ctx context.Context, link string) (resp *http.Response, err error) {
 	l, e := url.Parse(link)
 	if e != nil {
 		return nil, e
 	}
 	req := &http.Request{
-		Method: "GET",
+		Method: http.MethodGet,
 		URL:    l,
 	}
-	return c.Do(req)
+	return c.Do(ctx, req)
 }
 
-func (c *rlClient) Post(link string, contentType string, body io.Reader) (resp *http.Response, err error) {
+func (c *slidingWindowRLClient) Post(ctx context.Context, link string, contentType string, body io.Reader) (resp *http.Response, err error) {
 	l, e := url.Parse(link)
 	if e != nil {
 		return nil, e
@@ -52,35 +59,41 @@ func (c *rlClient) Post(link string, contentType string, body io.Reader) (resp *
 		bdy = io.NopCloser(body)
 	}
 	req := &http.Request{
-		Method: "POST",
+		Method: http.MethodPost,
 		URL:    l,
 		Body:   bdy,
 		Header: http.Header{
 			"Content-Type": []string{contentType},
 		},
 	}
-	return c.Do(req)
+	return c.Do(ctx, req)
 }
 
-func (c *rlClient) Do(req *http.Request) (*http.Response, error) {
+func (c *slidingWindowRLClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	// check if context is done
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	c.mu.Lock()
+	rlIntervalSec := c.intervalInSeconds
+	rlLimit := c.requestsPerInterval
+	c.mu.Unlock()
+
 	// get epoch time
 	timeNow := time.Now().Unix()
-	// check the interval start time
-	intervalStart := timeNow - int64(c.intervalInSeconds)
-	totalRequestsSinceIntervalStart := 0
-	for i := 0; i <= c.intervalInSeconds; i++ {
-		if _, ok := c.requests[intervalStart+int64(i)]; !ok {
-			c.requests[intervalStart+int64(i)] = 0
-		}
-
-		totalRequestsSinceIntervalStart += c.requests[intervalStart+int64(i)]
+	intervalStart := timeNow - int64(rlIntervalSec)
+	currCnt, err := c.store.GetRequestsCountInInterval(ctx, time.Unix(intervalStart, 0), time.Now())
+	if err != nil {
+		return nil, ErrGettingRequestsCount
 	}
-	if totalRequestsSinceIntervalStart >= c.requestsPerInterval {
-		return nil, errors.New("rate limit exceeded")
+	if currCnt >= rlLimit {
+		return nil, ErrRateLimitExceeded
 	}
-	if _, ok := c.requests[timeNow]; !ok {
-		c.requests[timeNow] = 0
+	if err := c.store.IncrementRequestCount(ctx, time.Now()); err != nil {
+		return nil, ErrAddingRequestCount
 	}
-	c.requests[timeNow]++
 	return c.client.Do(req)
 }
