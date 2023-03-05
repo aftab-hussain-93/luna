@@ -1,3 +1,3 @@
-module github.com/aftab-hussain-93/sliding-window-rate-limiter
+module github.com/aftab-hussain-93/luna
 
 go 1.20
