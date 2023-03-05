@@ -1,4 +1,4 @@
-package main
+package luna
 
 import (
 	"context"
@@ -9,25 +9,25 @@ import (
 	"time"
 )
 
-type mockClient struct {
+type mockSwRlClient struct {
 	count int
 }
 
-type mockStorage map[int64]int
+type mockSwRlStorage map[int64]int
 
-func (c *mockClient) Do(req *http.Request) (*http.Response, error) {
+func (c *mockSwRlClient) Do(req *http.Request) (*http.Response, error) {
 	c.count++
 	return nil, nil
 }
-func (c *mockClient) Get(url string) (resp *http.Response, err error) {
+func (c *mockSwRlClient) Get(url string) (resp *http.Response, err error) {
 	return nil, nil
 }
 
-func (c *mockClient) Post(url string, contentType string, body io.Reader) (resp *http.Response, err error) {
+func (c *mockSwRlClient) Post(url string, contentType string, body io.Reader) (resp *http.Response, err error) {
 	return nil, nil
 }
 
-func (s mockStorage) GetRequestsCountInInterval(ctx context.Context, start, end time.Time) (int, error) {
+func (s mockSwRlStorage) GetRequestsCountInInterval(ctx context.Context, start, end time.Time) (int, error) {
 	endUnix := end.Unix()
 	intervalStartInUnix := start.Unix()
 	cnt := 0
@@ -39,7 +39,7 @@ func (s mockStorage) GetRequestsCountInInterval(ctx context.Context, start, end 
 	return cnt, nil
 }
 
-func (s mockStorage) IncrementRequestCount(ctx context.Context, key time.Time) error {
+func (s mockSwRlStorage) IncrementRequestCount(ctx context.Context, key time.Time) error {
 	s[key.Unix()]++
 	return nil
 }
@@ -54,12 +54,13 @@ type doTest struct {
 var doTests = []doTest{
 	{10, 50, 50, 50},
 	{10, 50, 100, 50},
+	{10, 40, 100, 40},
 }
 
 func TestDo(t *testing.T) {
 	for _, tt := range doTests {
-		mc := &mockClient{}
-		mockStorage := mockStorage{}
+		mc := &mockSwRlClient{}
+		mockStorage := mockSwRlStorage{}
 		rlClient := NewSlidingWindowRLClient(mc, tt.intervalInSeconds, tt.requestsPerInterval, mockStorage, false)
 		ctx := context.Background()
 		for i := 0; i < tt.requestedCount; i++ {
@@ -72,8 +73,8 @@ func TestDo(t *testing.T) {
 }
 
 func TestDoRateLimitShouldError(t *testing.T) {
-	mc := &mockClient{}
-	mockStorage := mockStorage{}
+	mc := &mockSwRlClient{}
+	mockStorage := mockSwRlStorage{}
 	shouldError := false
 	rlClient := NewSlidingWindowRLClient(mc, 1, 1, mockStorage, shouldError)
 	ctx := context.Background()
@@ -88,8 +89,8 @@ func TestDoRateLimitShouldError(t *testing.T) {
 }
 
 func TestDoRateLimitShouldWait(t *testing.T) {
-	mc := &mockClient{}
-	mockStorage := mockStorage{}
+	mc := &mockSwRlClient{}
+	mockStorage := mockSwRlStorage{}
 	allowWait := true
 	rlClient := NewSlidingWindowRLClient(mc, 2, 1, mockStorage, allowWait)
 	ctx := context.Background()
@@ -104,8 +105,8 @@ func TestDoRateLimitShouldWait(t *testing.T) {
 }
 
 func TestCtxDeadline(t *testing.T) {
-	mc := &mockClient{}
-	mockStorage := mockStorage{}
+	mc := &mockSwRlClient{}
+	mockStorage := mockSwRlStorage{}
 	allowWait := true
 	rlClient := NewSlidingWindowRLClient(mc, 1, 1, mockStorage, allowWait)
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(1*time.Second))
@@ -121,8 +122,8 @@ func TestCtxDeadline(t *testing.T) {
 }
 
 func TestCtxCancel(t *testing.T) {
-	mc := &mockClient{}
-	mockStorage := mockStorage{}
+	mc := &mockSwRlClient{}
+	mockStorage := mockSwRlStorage{}
 	allowWait := true
 	rlClient := NewSlidingWindowRLClient(mc, 1, 1, mockStorage, allowWait)
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(1*time.Second))

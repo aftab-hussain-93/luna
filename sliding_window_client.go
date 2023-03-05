@@ -1,35 +1,19 @@
-package main
+package luna
 
 import (
 	"context"
 	"io"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
 )
 
-type slidingWindowRLClient struct {
-	mu                  sync.Mutex
-	client              client
-	store               storage
-	intervalInSeconds   int
-	requestsPerInterval int
-	allowWait           bool
-}
-
-type client interface {
-	Do(req *http.Request) (*http.Response, error)
-}
-
-type storage interface {
-	// get the number of requests made in the provided interval
-	GetRequestsCountInInterval(ctx context.Context, start, end time.Time) (int, error)
-	// increment the number of requests made in the current interval
-	IncrementRequestCount(ctx context.Context, key time.Time) error
-}
-
-func NewSlidingWindowRLClient(cl client, intervalInSeconds, requestsPerInterval int, st storage, allowWait bool) *slidingWindowRLClient {
+// Creates a new sliding window rate limited client
+// intervalInSeconds: the interval in seconds
+// requestsPerInterval: the number of requests allowed in the interval
+// st: the storage to use
+// allowWait: if true, the client will wait until the next interval to send the request, if false, it will return an error
+func NewSlidingWindowRLClient(cl client, intervalInSeconds, requestsPerInterval int, st rlStorage, allowWait bool) *slidingWindowRLClient {
 	return &slidingWindowRLClient{
 		client:              cl,
 		intervalInSeconds:   intervalInSeconds,
@@ -39,6 +23,8 @@ func NewSlidingWindowRLClient(cl client, intervalInSeconds, requestsPerInterval 
 	}
 }
 
+// Get sends a GET request to the provided link, it's a wrapper around rate limited Do method that ensures that the rate limit is not exceeded
+// link: the link to send the request to
 func (c *slidingWindowRLClient) Get(ctx context.Context, link string) (resp *http.Response, err error) {
 	l, e := url.Parse(link)
 	if e != nil {
@@ -51,6 +37,10 @@ func (c *slidingWindowRLClient) Get(ctx context.Context, link string) (resp *htt
 	return c.Do(ctx, req)
 }
 
+// Post sends a POST request to the provided link, it's a wrapper around rate limited Do method that ensures that the rate limit is not exceeded
+// link: the link to send the request to
+// contentType: the content type of the body
+// body: the body of the request
 func (c *slidingWindowRLClient) Post(ctx context.Context, link string, contentType string, body io.Reader) (resp *http.Response, err error) {
 	l, e := url.Parse(link)
 	if e != nil {
@@ -78,19 +68,30 @@ func (c *slidingWindowRLClient) Do(ctx context.Context, req *http.Request) (*htt
 		return nil, ctx.Err()
 	default:
 	}
+	allowWait := false
+	c.mu.Lock()
+	allowWait = c.allowWait
+	c.mu.Unlock()
 
+	// check if rate limit is already exceeded
 	hasExceeded, err := c.hasExceededRateLimit(ctx)
 	if err != nil {
 		return nil, err
 	}
+	// if rate limit is not exceeded, send the request
 	if !hasExceeded {
 		return c.sendRequest(ctx, req)
 	}
-	// rate limit exceeded, return error or wait
-	if !c.allowWait {
+
+	// rate limit is exceeded, check if we can wait
+	if !allowWait {
 		return nil, ErrRateLimitExceeded
 	}
-	return c.waitDoer(ctx, req)
+
+	if err := c.wait(ctx); err != nil {
+		return nil, err
+	}
+	return c.sendRequest(ctx, req)
 }
 
 func (c *slidingWindowRLClient) sendRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
@@ -100,38 +101,40 @@ func (c *slidingWindowRLClient) sendRequest(ctx context.Context, req *http.Reque
 	return c.client.Do(req)
 }
 
-func (c *slidingWindowRLClient) waitDoer(ctx context.Context, req *http.Request) (*http.Response, error) {
-	// find next open window
+// wait function waits until the next possible interval to send the request
+func (c *slidingWindowRLClient) wait(ctx context.Context) error {
 	nextOpenWindow, err := c.findNextOpenWindow(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	dl, hasDl := ctx.Deadline()
-	if hasDl && nextOpenWindow.After(dl) {
-		return nil, ErrTimeOut
+	// checking if the context has a deadline and if the next open window is after the deadline
+	if deadline, ok := ctx.Deadline(); ok && nextOpenWindow.After(deadline) {
+		return ErrTimeOut
 	}
 	t := time.NewTimer(time.Until(nextOpenWindow))
+	// we wait until the next open window or until the context is done
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
 	case <-t.C:
-		return c.sendRequest(ctx, req)
+		return nil
 	}
 }
 
+// hasExceededRateLimit checks if the rate limit is exceeded
 func (c *slidingWindowRLClient) hasExceededRateLimit(ctx context.Context) (bool, error) {
 	c.mu.Lock()
 	rlIntervalSec := c.intervalInSeconds
 	rlLimit := c.requestsPerInterval
 	c.mu.Unlock()
-	// get epoch time
 	timeNow := time.Now()
 	intervalStart := timeNow.Add(time.Duration(-rlIntervalSec) * time.Second)
-	currCnt, err := c.store.GetRequestsCountInInterval(ctx, intervalStart, timeNow)
+
+	currentCount, err := c.store.GetRequestsCountInInterval(ctx, intervalStart, timeNow)
 	if err != nil {
 		return false, ErrGettingRequestsCount
 	}
-	return currCnt >= rlLimit, nil
+	return currentCount >= rlLimit, nil
 }
 
 func (c *slidingWindowRLClient) findNextOpenWindow(ctx context.Context) (time.Time, error) {
@@ -139,7 +142,7 @@ func (c *slidingWindowRLClient) findNextOpenWindow(ctx context.Context) (time.Ti
 	rlIntervalSec := c.intervalInSeconds
 	rlLimit := c.requestsPerInterval
 	c.mu.Unlock()
-	// get epoch time
+
 	windowEnd := time.Now()
 	windowStart := windowEnd.Add(time.Duration(-rlIntervalSec) * time.Second)
 	for {
